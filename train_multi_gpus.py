@@ -108,7 +108,7 @@ class NpyDataset(Dataset):
         )
 
 
-# %% sanity test of dataset class
+# %% sanity test of dataset class 健全性测试
 tr_dataset = NpyDataset("data/npy/CT_Abd")
 tr_dataloader = DataLoader(tr_dataset, batch_size=8, shuffle=True)
 for step, (image, gt, bboxes, names_temp) in enumerate(tr_dataloader):

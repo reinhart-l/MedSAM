@@ -4,7 +4,7 @@ import os
 join = os.path.join 
 from skimage import io, transform
 from tqdm import tqdm
-
+import cc3d
 # convert 2D data to npy files, including images and corresponding masks
 modality = 'dd' # e.g., 'Dermoscopy 
 anatomy = 'dd'  # e.g., 'SkinCancer'
