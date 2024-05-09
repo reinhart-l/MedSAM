@@ -23,7 +23,7 @@ print(f'ori \# files {len(names)=}')
 
 # set label ids that are excluded
 remove_label_ids = [] 
-tumor_id = None # only set this when there are multiple tumors in one image; convert semantic masks to instance masks
+tumor_id = None  # only set this when there are multiple tumors in one image; convert semantic masks to instance masks
 label_id_offset = 0
 do_intensity_cutoff = False # True for grey images
 #%% save preprocessed images and masks as npz files
