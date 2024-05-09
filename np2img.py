@@ -16,23 +16,26 @@ def show_mask(mask, ax, random_color=False):
     mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
     ax.imshow(mask_image)
 
-
-with np.load('./test_demo/imgs/2DBox_Mammography_demo.npz') as data:
+data = np.load('./data/endovis_2018_instrument/val/npy/bi_gts/seq_15_frame000.npy')
+print(data.shape)
+with np.load('./data/endovis_2018_instrument/train/npy/seq_10_frame000.npz') as data:
     arrays = data.files
     print("Keys:", arrays)
 
     # 假设 array1 是图像数据，array2 是边界框数据
     image_data = data[arrays[0]]
     boxes = data[arrays[1]]
-
+    print(image_data.shape)
+    print(boxes.shape)
     _, axs = plt.subplots(1, 2, figsize=(25, 25))
 
-    # 显示图像
-    axs[0].imshow(image_data)  # 确保 image_data 是正确的图像数据
-    axs[0].axis("off")
-
-    # 显示边界框
-    show_box(boxes[1], axs[0])  # 假设 boxes[0] 包含第一个边界框的坐标
+    # # 显示图像
+    # axs[0].imshow(image_data)  # 确保 image_data 是正确的图像数据
+    # axs[1].imshow(boxes)  # 确保 image_data 是正确的图像数据
+    # axs[0].axis("off")
+    #
+    # # 显示边界框
+    # show_box(boxes[1], axs[0])  # 假设 boxes[0] 包含第一个边界框的坐标
 
     # 如果 array2 是一个二维口罩图像
     mask = data[arrays[2]] if len(arrays) > 2 else None
@@ -52,3 +55,16 @@ with np.load('./test_demo/imgs/2DBox_Mammography_demo.npz') as data:
 # plt.imshow(image_array)  # 如果是灰度图像，使用 cmap='gray' 参数
 # plt.imshow(image_array2)
 # plt.axis('off')  # 关闭坐标轴
+# %% label to image json
+import os
+import json
+img_path="./data/endovis_2018_instrument/val/images/"
+mask_path="./data/endovis_2018_instrument/val/binary_annotations/"
+mapping = {}
+for i in os.listdir(mask_path):
+    img_name = i.split('_class')[0] + '.png'
+    mapping[mask_path+i]=img_path + img_name
+print(mapping)
+# 将字典转换为 JSON 格式并写入文件
+with open("./data/endovis_2018_instrument/val/label2image_test.json", "w") as json_file:
+    json.dump(mapping, json_file, indent=4)
