@@ -11,7 +11,7 @@ from tqdm import tqdm
 from utils import train_transforms, get_boxes_from_mask, init_point_sampling
 import json
 import random
-
+import torchvision.transforms.functional as TF
 
 class TestingDataset(Dataset):
 
@@ -55,6 +55,7 @@ class TestingDataset(Dataset):
         image_input = {}
         try:
             image = cv2.imread(self.image_paths[index])
+            ori_image = image
             image = (image - self.pixel_mean) / self.pixel_std
         except:
             print(self.image_paths[index])
@@ -83,7 +84,8 @@ class TestingDataset(Dataset):
             boxes = torch.as_tensor(self.prompt_list[prompt_key]["boxes"], dtype=torch.float)
             point_coords = torch.as_tensor(self.prompt_list[prompt_key]["point_coords"], dtype=torch.float)
             point_labels = torch.as_tensor(self.prompt_list[prompt_key]["point_labels"], dtype=torch.int)
-
+        # print("point_coords", point_coords)
+        image_input["ori_image"] = ori_image
         image_input["image"] = image
         image_input["label"] = mask.unsqueeze(0)
         image_input["point_coords"] = point_coords
@@ -201,10 +203,17 @@ def stack_dict_batched(batched_input):
 
 
 if __name__ == "__main__":
-    train_dataset = TrainingDataset("data_demo", image_size=256, mode='train', requires_name=True, point_num=1,
-                                    mask_num=5)
-    print("Dataset:", len(train_dataset))
-    train_batch_sampler = DataLoader(dataset=train_dataset, batch_size=2, shuffle=True, num_workers=4)
+    # train_dataset = TrainingDataset("data/endovis_2018_instrument/val", image_size=1024, mode='train', requires_name=True, point_num=1,
+    #                                 mask_num=5)
+    # print("Dataset:", len(train_dataset))
+    # train_batch_sampler = DataLoader(dataset=train_dataset, batch_size=2, shuffle=True, num_workers=4)
+    # for i, batched_image in enumerate(tqdm(train_batch_sampler)):
+    #     batched_image = stack_dict_batched(batched_image)
+    #     print(batched_image["image"].shape, batched_image["label"].shape)
+    test_dataset = TestingDataset("data/endovis_2018_instrument/val", image_size=1024, mode='test',
+                                    requires_name=True, point_num=1)
+    print("Dataset:", len(test_dataset))
+    train_batch_sampler = DataLoader(dataset=test_dataset, batch_size=1, shuffle=True, num_workers=4)
     for i, batched_image in enumerate(tqdm(train_batch_sampler)):
         batched_image = stack_dict_batched(batched_image)
         print(batched_image["image"].shape, batched_image["label"].shape)

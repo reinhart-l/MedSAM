@@ -68,3 +68,25 @@ print(mapping)
 # 将字典转换为 JSON 格式并写入文件
 with open("./data/endovis_2018_instrument/val/label2image_test.json", "w") as json_file:
     json.dump(mapping, json_file, indent=4)
+
+# %%image to label json
+import os
+import json
+img_path="./data/endovis_2018_instrument/val/images/"
+mask_path="./data/endovis_2018_instrument/val/binary_annotations/"
+image_masks = {}
+for img_file in os.listdir(img_path):
+
+    if img_file.endswith('.png'):
+        img_name = img_file.split('.')[0]
+        image_path = os.path.join(img_path, img_file)
+        # List all mask files corresponding to the image
+        masks = [f for f in os.listdir(mask_path) if img_name in f]
+        mask_paths = [os.path.join(mask_path, mask) for mask in masks]
+        # Add to dictionary
+        if mask_paths:
+            image_masks[image_path] = mask_paths
+print(image_masks)
+# 将字典转换为 JSON 格式并写入文件
+with open("./data/endovis_2018_instrument/train/image2label_train.json", "w") as json_file:
+    json.dump(image_masks, json_file, indent=4)

@@ -219,7 +219,7 @@ def draw_boxes(img, boxes):
     return img_copy
 
 
-def save_masks(preds, save_path, mask_name, image_size, original_size, pad=None,  boxes=None, points=None, visual_prompt=False):
+def save_masks(preds, save_path, mask_name, image_size, original_size, pad=None,  boxes=None, points=None, visual_prompt=True):
     ori_h, ori_w = original_size
 
     preds = torch.sigmoid(preds)
@@ -260,12 +260,66 @@ def save_masks(preds, save_path, mask_name, image_size, original_size, pad=None,
                 x, y = map(int, point)
                 color = (0, 255, 0) if label == 1 else (0, 0, 255)
                 mask[y, x] = color
-                cv2.drawMarker(mask, (x, y), color, markerType=cv2.MARKER_CROSS , markerSize=7, thickness=2)  
+                cv2.drawMarker(mask, (x, y), color, markerType=cv2.MARKER_CROSS , markerSize=10, thickness=5)
     os.makedirs(save_path, exist_ok=True)
     mask_path = os.path.join(save_path, f"{mask_name}")
     cv2.imwrite(mask_path, np.uint8(mask))
 
+def save_imgs_prompts_masks(preds, save_path, mask_name, image_size, original_size, original_image, pad=None, boxes=None, points=None, visual_prompt=True):
+    ori_h, ori_w = original_size
 
+    preds = torch.sigmoid(preds)
+    preds[preds > 0.5] = int(1)
+    preds[preds <= 0.5] = int(0)
+
+    mask = preds.squeeze().cpu().numpy().astype(np.uint8)
+    # 创建一个带Alpha通道的新图像
+    mask_rgba = cv2.cvtColor(mask * 255, cv2.COLOR_GRAY2RGBA)
+    # 设置alpha通道，掩码为0的地方设置透明度为0，其它地方设置透明度为153 (即0.6 * 255)
+    alpha = 0.6  # 透明度
+    mask_rgba[:, :, 3] = np.where(mask == 0, 0, 255 * alpha )
+
+    if visual_prompt:
+        if boxes is not None:
+            boxes = boxes.squeeze().cpu().numpy()
+
+            x0, y0, x1, y1 = boxes
+            if pad is not None:
+                x0_ori = int((x0 - pad[1]) + 0.5)
+                y0_ori = int((y0 - pad[0]) + 0.5)
+                x1_ori = int((x1 - pad[1]) + 0.5)
+                y1_ori = int((y1 - pad[0]) + 0.5)
+            else:
+                x0_ori = int(x0 * ori_w / image_size)
+                y0_ori = int(y0 * ori_h / image_size)
+                x1_ori = int(x1 * ori_w / image_size)
+                y1_ori = int(y1 * ori_h / image_size)
+
+            boxes = [(x0_ori, y0_ori, x1_ori, y1_ori)]
+            original_image = draw_boxes(original_image,boxes)
+
+        if points is not None:
+            point_coords, point_labels = points[0].squeeze(0).cpu().numpy(), points[1].squeeze(0).cpu().numpy()
+            point_coords = point_coords.tolist()
+            if pad is not None:
+                ori_points = [[int((x * ori_w / image_size)), int((y * ori_h / image_size))] if l == 0 else [x - pad[1], y - pad[0]] for (x, y), l in zip(point_coords, point_labels)]
+            else:
+                ori_points = [[int((x * ori_w / image_size)), int((y * ori_h / image_size))] for x, y in point_coords]
+
+            for point, label in zip(ori_points, point_labels):
+                x, y = map(int, point)
+                color = (0, 255, 0) if label == 1 else (0, 0, 255)
+                mask[y, x] = color
+                cv2.drawMarker(original_image, (x, y), color, markerType=cv2.MARKER_CROSS, markerSize=7, thickness=2)
+
+
+    for c in range(3):  # 只合并RGB通道
+        original_image[:, :, c] = original_image[:, :, c] * (1 - (mask_rgba[:, :, 3] / 255.0)) + mask_rgba[:, :, c] * (
+                    mask_rgba[:, :, 3] / 255.0)
+
+    os.makedirs(save_path, exist_ok=True)
+    prompts_imgs_path = os.path.join(save_path, f"{mask_name}")
+    cv2.imwrite(prompts_imgs_path, original_image)
 #Loss funcation
 class FocalLoss(nn.Module):
     def __init__(self, gamma=2.0, alpha=0.25):

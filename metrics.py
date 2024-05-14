@@ -32,7 +32,7 @@ def iou(pr, gt, eps=1e-7, threshold = 0.5):
     return ((intersection + eps) / (union + eps)).cpu().numpy()
 
 
-def dice(pr, gt, eps=1e-7, threshold = 0.5):
+def dice(pr, gt, eps=1e-7, threshold = 0.5):  # DSC
     pr_, gt_ = _list_tensor(pr, gt)
     pr_ = _threshold(pr_, threshold=threshold)
     gt_ = _threshold(gt_, threshold=threshold)
