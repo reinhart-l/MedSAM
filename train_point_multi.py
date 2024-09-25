@@ -15,13 +15,35 @@ import datetime
 from torch.nn import functional as F
 # from apex import amp
 import random
+import torch.multiprocessing as mp
+import socket
+# set seeds
+torch.manual_seed(2023)
+torch.cuda.empty_cache()
 
+def get_master_addr():
+    # 获取主节点的主机名或IP地址
+    master_addr = os.getenv("MASTER_ADDR", "localhost")
+    return master_addr
 
+def get_free_port():
+    # 获取一个空闲的端口
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(('', 0))
+    free_port = sock.getsockname()[1]
+    sock.close()
+    return free_port
+
+def compute_init_method():
+    master_addr = get_master_addr()
+    master_port = get_free_port()
+    init_method = f"tcp://{master_addr}:{master_port}"
+    return init_method
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--work_dir", type=str, default="work_dir", help="work dir")
 
-    parser.add_argument("--run_name", type=str, default="MedSAM_adapter_25epo", help="run model name")
+    parser.add_argument("--run_name", type=str, default="MedSAM_adapter_20epo", help="run model name")
     # parser.add_argument("--run_name", type=str, default="MedSAM_adapter", help="run model name")
     # parser.add_argument("--run_name", type=str, default="MedSAM_adapter", help="run model name")
     # parser.add_argument("--run_name", type=str, default="MedSAM", help="run model name")
@@ -29,8 +51,8 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=20, help="number of epochs")
     parser.add_argument("--batch_size", type=int, default=2, help="train batch size")
     parser.add_argument("--image_size", type=int, default=1024, help="image_size")
-    parser.add_argument("--mask_num", type=int, default=5, help="get mask number")
-    parser.add_argument("--data_path", type=str, default="./data/SIS/train", help="train data path")
+    parser.add_argument("--mask_num", type=int, default=1, help="get mask number")
+    parser.add_argument("--data_path", type=str, default="./data/endovis_2018_instrument/train", help="train data path")
     parser.add_argument("--metrics", nargs='+', default=['iou', 'dice'], help="metrics")
     parser.add_argument('--device', type=str, default='cuda:1')
     parser.add_argument("--lr", type=float, default=1e-4, help="learning rate")
@@ -43,9 +65,18 @@ def parse_args():
     parser.add_argument("--multimask", type=bool, default=False, help="ouput multimask")
     parser.add_argument("--encoder_adapter", type=bool, default=True, help="use adapter")
     parser.add_argument("--use_amp", type=bool, default=False, help="use amp")
+    ## Distributed training args
+    parser.add_argument("--world_size", type=int,default=2, help="world size")
+    parser.add_argument("--node_rank", type=int, default=0, help="Node rank")
+    parser.add_argument(
+        "--bucket_cap_mb",
+        type=int,
+        default=25,
+        help="The amount of memory in Mb that DDP will accumulate before firing off gradient communication for the bucket (need to tune)",
+    )
     args = parser.parse_args()
     if args.resume is not None:
-        args.checkpoint = None
+        args.sam_checkpoint = None
     return args
 
 
@@ -232,10 +263,63 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion):
 
     return train_losses, train_iter_metrics
 
+def main():
+    ngpus_per_node = torch.cuda.device_count()
+    print("Spwaning processces")
+    mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
 
-def main(args):
-    model = sam_model_registry[args.model_type](args).to(args.device)
+def main_worker(gpu, ngpus_per_node, args):
+    node_rank = int(args.node_rank)
+    rank = node_rank * ngpus_per_node + gpu
+    world_size = args.world_size
+    print(f"[Rank {rank}]: Use GPU: {gpu} for training")
+    is_main_host = rank == 0
+
+    torch.cuda.set_device(gpu)
+    # device = torch.device("cuda:{}".format(gpu))
+    init_method = compute_init_method()
+    print(init_method)
+    torch.distributed.init_process_group(
+        backend="nccl", init_method=init_method, rank=rank, world_size=world_size
+    )
+    model = sam_model_registry[args.model_type](args).cuda()
     # model = sam_model_registry[args.model_type](checkpoint=args.checkpoint).to(args.device)
+    cuda_mem_info = torch.cuda.mem_get_info(gpu)
+    free_cuda_mem, total_cuda_mem = cuda_mem_info[0] / (1024 ** 3), cuda_mem_info[1] / (
+            1024 ** 3
+    )
+    print(
+        f"[RANK {rank}: GPU {gpu}] Total CUDA memory before DDP initialised: {total_cuda_mem} Gb"
+    )
+    print(
+        f"[RANK {rank}: GPU {gpu}] Free CUDA memory before DDP initialised: {free_cuda_mem} Gb"
+    )
+    if rank % ngpus_per_node == 0:
+        print("Before DDP initialization:")
+        os.system("nvidia-smi")
+    model = nn.parallel.DistributedDataParallel(
+        model,
+        device_ids=[gpu],
+        output_device=gpu,
+        gradient_as_bucket_view=True,
+        find_unused_parameters=True,
+        bucket_cap_mb=args.bucket_cap_mb,
+        ## Too large -> comminitation overlap, too small -> unable to overlap with computation
+    )
+    cuda_mem_info = torch.cuda.mem_get_info(gpu)
+    free_cuda_mem, total_cuda_mem = cuda_mem_info[0] / (1024 ** 3), cuda_mem_info[1] / (
+            1024 ** 3
+    )
+    print(
+        f"[RANK {rank}: GPU {gpu}] Total CUDA memory after DDP initialised: {total_cuda_mem} Gb"
+    )
+    print(
+        f"[RANK {rank}: GPU {gpu}] Free CUDA memory after DDP initialised: {free_cuda_mem} Gb"
+    )
+    if rank % ngpus_per_node == 0:
+        print("After DDP initialization:")
+        os.system("nvidia-smi")
+
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     criterion = FocalDiceloss_IoULoss()
 
@@ -245,10 +329,12 @@ def main(args):
 
     if args.resume is not None:
         with open(args.resume, "rb") as f:
-            checkpoint = torch.load(f)
+            loc = "cuda:{}".format(gpu)
+            checkpoint = torch.load(f, map_location=loc)
             model.load_state_dict(checkpoint['model'])
             optimizer.load_state_dict(checkpoint['optimizer'].state_dict())
             print(f"*******load {args.resume}")
+        torch.distributed.barrier()
 
     if args.use_amp:
         # model, optimizer = amp.initialize(model, optimizer, opt_level="O1")
@@ -258,12 +344,13 @@ def main(args):
 
     train_dataset = TrainingDataset(args.data_path, image_size=args.image_size, mode='train', point_num=1,
                                     mask_num=args.mask_num, requires_name=False)
-    train_dataset.save_boxes_log()
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
+                              num_workers=args.num_workers,pin_memory=True,sampler=train_sampler)
     print('*******Train data:', len(train_dataset))
-
-    loggers = get_logger(
-        os.path.join(args.work_dir, "logs", f"{args.run_name}_{datetime.datetime.now().strftime('%Y%m%d-%H%M.log')}"))
+    if is_main_host:
+        loggers = get_logger(
+            os.path.join(args.work_dir, "logs", f"{args.run_name}_{datetime.datetime.now().strftime('%Y%m%d-%H%M.log')}"))
 
     best_loss = 1e10
     l = len(train_loader)
@@ -284,20 +371,21 @@ def main(args):
 
         average_loss = np.mean(train_losses)
         lr = scheduler.get_last_lr()[0] if args.lr_scheduler is not None else args.lr
-        loggers.info(f"epoch: {epoch + 1}, lr: {lr}, Train loss: {average_loss:.4f}, metrics: {train_metrics}")
+        if is_main_host:
+            loggers.info(f"epoch: {epoch + 1}, lr: {lr}, Train loss: {average_loss:.4f}, metrics: {train_metrics}")
 
-        if average_loss < best_loss:
-            best_loss = average_loss
-            save_path = os.path.join(args.work_dir, "models", args.run_name, f"epoch{epoch + 1}_sam.pth")
-            state = {'model': model.float().state_dict(), 'optimizer': optimizer}
-            torch.save(state, save_path)
-            if args.use_amp:
-                model = model.half()
-
+            if average_loss < best_loss:
+                best_loss = average_loss
+                save_path = os.path.join(args.work_dir, "models", args.run_name, f"epoch{epoch + 1}_sam.pth")
+                state = {'model': model.float().state_dict(), 'optimizer': optimizer}
+                torch.save(state, save_path)
+                if args.use_amp:
+                    model = model.half()
+        torch.distributed.barrier()
         end = time.time()
         print("Run epoch time: %.2fs" % (end - start))
 
 
 if __name__ == '__main__':
     args = parse_args()
-    main(args)
+    main()

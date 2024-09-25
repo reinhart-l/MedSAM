@@ -15,7 +15,22 @@ import datetime
 from torch.nn import functional as F
 # from apex import amp
 import random
-
+import argparse
+import os
+import random
+import datetime
+import numpy as np
+import torch
+import torch.distributed as dist
+from torch import optim
+from torch.nn import functional as F
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from segment_anything import sam_model_registry
+from DataLoader import TrainingDataset, stack_dict_batched
+from utils import FocalDiceloss_IoULoss, get_logger, generate_point, setting_prompt_none
+from metrics import SegMetrics
+from tqdm import tqdm
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -26,7 +41,8 @@ def parse_args():
     # parser.add_argument("--run_name", type=str, default="MedSAM_adapter", help="run model name")
     # parser.add_argument("--run_name", type=str, default="MedSAM", help="run model name")
 
-    parser.add_argument("--epochs", type=int, default=20, help="number of epochs")
+    parser.add_argument("--start_epoch", type=int, default=0, help="start epoch when using resume")
+    parser.add_argument("--epochs", type=int, default=6, help="number of epochs")
     parser.add_argument("--batch_size", type=int, default=2, help="train batch size")
     parser.add_argument("--image_size", type=int, default=1024, help="image_size")
     parser.add_argument("--mask_num", type=int, default=5, help="get mask number")
@@ -43,11 +59,23 @@ def parse_args():
     parser.add_argument("--multimask", type=bool, default=False, help="ouput multimask")
     parser.add_argument("--encoder_adapter", type=bool, default=True, help="use adapter")
     parser.add_argument("--use_amp", type=bool, default=False, help="use amp")
+    # parser.add_argument('--gpu_ids', type=str, default='1,3', help='Comma-separated list of GPU ids to use.')
+    # parser.add_argument('--local_rank', type=int, default=0, help='Local rank for distributed training')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed')
+
     args = parser.parse_args()
     if args.resume is not None:
         args.checkpoint = None
     return args
 
+def set_random_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+def is_main_process():
+    return dist.get_rank() == 0
 
 def to_device(batch_input, device):
     device_input = {}
@@ -72,22 +100,22 @@ def prompt_and_decoder(args, batched_input, model, image_embeddings, decoder_ite
     # decoder_iter如果为true就冻结prompt_encoder
     if decoder_iter:
         with torch.no_grad():
-            sparse_embeddings, dense_embeddings = model.prompt_encoder(
+            sparse_embeddings, dense_embeddings = model.module.prompt_encoder(
                 points=points,
                 boxes=batched_input.get("boxes", None),
                 masks=batched_input.get("mask_inputs", None),
             )
 
     else:
-        sparse_embeddings, dense_embeddings = model.prompt_encoder(
+        sparse_embeddings, dense_embeddings = model.module.prompt_encoder(
             points=points,
             boxes=batched_input.get("boxes", None),
             masks=batched_input.get("mask_inputs", None),
         )
 
-    low_res_masks, iou_predictions = model.mask_decoder(
+    low_res_masks, iou_predictions = model.module.mask_decoder(
         image_embeddings=image_embeddings,
-        image_pe=model.prompt_encoder.get_dense_pe(),
+        image_pe=model.module.prompt_encoder.get_dense_pe(),
         sparse_prompt_embeddings=sparse_embeddings,
         dense_prompt_embeddings=dense_embeddings,
         multimask_output=args.multimask,
@@ -107,7 +135,8 @@ def prompt_and_decoder(args, batched_input, model, image_embeddings, decoder_ite
 
 
 def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion):
-    train_loader = tqdm(train_loader)
+    torch.cuda.empty_cache()
+    train_loader = tqdm(train_loader) if is_main_process() else train_loader  # 仅主进程显示进度条
     train_losses = []
     train_iter_metrics = [0] * len(args.metrics)
     for batch, batched_input in enumerate(train_loader):
@@ -121,7 +150,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion):
             batched_input["boxes"] = None
             flag = "point"
 
-        for n, value in model.image_encoder.named_parameters():
+        for n, value in model.module.image_encoder.named_parameters():
             if "Adapter" in n:
                 value.requires_grad = True
             else:
@@ -129,7 +158,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion):
 
         if args.use_amp:
             labels = batched_input["label"].half()
-            image_embeddings = model.image_encoder(batched_input["image"].half())
+            image_embeddings = model.module.image_encoder(batched_input["image"].half())
 
             batch, _, _, _ = image_embeddings.shape
             image_embeddings_repeat = []
@@ -147,7 +176,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion):
 
         else:
             labels = batched_input["label"]
-            image_embeddings = model.image_encoder(batched_input["image"])
+            image_embeddings = model.module.image_encoder(batched_input["image"])
 
             batch, _, _, _ = image_embeddings.shape
             image_embeddings_repeat = []
@@ -165,7 +194,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion):
         optimizer.step()
         optimizer.zero_grad()
 
-        if int(batch + 1) % 50 == 0:
+        if is_main_process() and (batch + 1) % 50 == 0:  # 仅主进程输出日志
             print(
                 f'Epoch: {epoch + 1}, Batch: {batch + 1}, first {flag} prompt: {SegMetrics(masks, labels, args.metrics)}')
 
@@ -206,7 +235,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion):
                 batched_input = generate_point(masks, labels, low_res_masks, batched_input, point_num)
                 batched_input = to_device(batched_input, args.device)
 
-            if int(batch + 1) % 50 == 0:
+            if is_main_process() and (batch + 1) % 50 == 0:  # 仅主进程输出日志
                 if iter == init_mask_num or iter == args.iter_point - 1:
                     print(
                         f'Epoch: {epoch + 1}, Batch: {batch + 1}, mask prompt: {SegMetrics(masks, labels, args.metrics)}')
@@ -214,7 +243,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion):
                     print(
                         f'Epoch: {epoch + 1}, Batch: {batch + 1}, point {point_num} prompt: {SegMetrics(masks, labels, args.metrics)}')
 
-        if int(batch + 1) % 200 == 0:
+        if is_main_process() and (batch + 1) % 200 == 0:  # 仅主进程保存模型
             print(f"epoch:{epoch + 1}, iteration:{batch + 1}, loss:{loss.item()}")
             save_path = os.path.join(f"{args.work_dir}/models", args.run_name,
                                      f"epoch{epoch + 1}_batch{batch + 1}_sam.pth")
@@ -225,7 +254,8 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion):
 
         gpu_info = {}
         gpu_info['gpu_name'] = args.device
-        train_loader.set_postfix(train_loss=loss.item(), gpu_info=gpu_info)
+        if is_main_process():  # 仅主进程显示进度条信息
+            train_loader.set_postfix(train_loss=loss.item(), gpu_info=gpu_info)
 
         train_batch_metrics = SegMetrics(masks, labels, args.metrics)
         train_iter_metrics = [train_iter_metrics[i] + train_batch_metrics[i] for i in range(len(args.metrics))]
@@ -234,8 +264,20 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion):
 
 
 def main(args):
+    set_random_seed(args.seed)
+    dist.init_process_group(backend='nccl', init_method='env://')
+
+    local_rank = int(os.environ['LOCAL_RANK'])
+    torch.cuda.set_device(local_rank)
+    args.device = torch.device('cuda', local_rank)
+
+    global_rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    # Build model
     model = sam_model_registry[args.model_type](args).to(args.device)
-    # model = sam_model_registry[args.model_type](checkpoint=args.checkpoint).to(args.device)
+    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
+
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     criterion = FocalDiceloss_IoULoss()
 
@@ -244,11 +286,13 @@ def main(args):
         print('*******Use MultiStepLR')
 
     if args.resume is not None:
-        with open(args.resume, "rb") as f:
-            checkpoint = torch.load(f)
-            model.load_state_dict(checkpoint['model'])
-            optimizer.load_state_dict(checkpoint['optimizer'].state_dict())
-            print(f"*******load {args.resume}")
+        checkpoint = torch.load(args.resume, map_location='cpu')
+        model.module.load_state_dict(checkpoint['model'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        # 使用resume时，从start_epoch开始
+        start_epoch = args.start_epoch
+    else:
+        start_epoch = 0
 
     if args.use_amp:
         # model, optimizer = amp.initialize(model, optimizer, opt_level="O1")
@@ -256,46 +300,54 @@ def main(args):
     else:
         print('*******Do not use mixed precision')
 
+        # Initialize dataset and dataloader with DistributedSampler
     train_dataset = TrainingDataset(args.data_path, image_size=args.image_size, mode='train', point_num=1,
                                     mask_num=args.mask_num, requires_name=False)
     train_dataset.save_boxes_log()
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+    train_sampler = DistributedSampler(train_dataset)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=train_sampler, num_workers=4,
+                              pin_memory=True)
     print('*******Train data:', len(train_dataset))
 
-    loggers = get_logger(
-        os.path.join(args.work_dir, "logs", f"{args.run_name}_{datetime.datetime.now().strftime('%Y%m%d-%H%M.log')}"))
+    if is_main_process():
+        loggers = get_logger(
+            os.path.join(args.work_dir, "logs",
+                         f"{args.run_name}_{datetime.datetime.now().strftime('%Y%m%d-%H%M.log')}"))
 
     best_loss = 1e10
     l = len(train_loader)
 
-    for epoch in range(0, args.epochs):
+    for epoch in range(start_epoch, args.epochs):
+        train_sampler.set_epoch(epoch)
         model.train()
         train_metrics = {}
-        start = time.time()
+        if is_main_process():
+            start = time.time()
         os.makedirs(os.path.join(f"{args.work_dir}/models", args.run_name), exist_ok=True)
         train_losses, train_iter_metrics = train_one_epoch(args, model, optimizer, train_loader, epoch, criterion)
 
         if args.lr_scheduler is not None:
             scheduler.step()
 
-        train_iter_metrics = [metric / l for metric in train_iter_metrics]
-        train_metrics = {args.metrics[i]: '{:.4f}'.format(train_iter_metrics[i]) for i in
-                         range(len(train_iter_metrics))}
+        if is_main_process():
+            train_iter_metrics = [metric / l for metric in train_iter_metrics]
+            train_metrics = {args.metrics[i]: '{:.4f}'.format(train_iter_metrics[i]) for i in
+                             range(len(train_iter_metrics))}
 
-        average_loss = np.mean(train_losses)
-        lr = scheduler.get_last_lr()[0] if args.lr_scheduler is not None else args.lr
-        loggers.info(f"epoch: {epoch + 1}, lr: {lr}, Train loss: {average_loss:.4f}, metrics: {train_metrics}")
+            average_loss = np.mean(train_losses)
+            lr = scheduler.get_last_lr()[0] if args.lr_scheduler is not None else args.lr
+            loggers.info(f"epoch: {epoch + 1}, lr: {lr}, Train loss: {average_loss:.4f}, metrics: {train_metrics}")
 
-        if average_loss < best_loss:
-            best_loss = average_loss
-            save_path = os.path.join(args.work_dir, "models", args.run_name, f"epoch{epoch + 1}_sam.pth")
-            state = {'model': model.float().state_dict(), 'optimizer': optimizer}
-            torch.save(state, save_path)
-            if args.use_amp:
-                model = model.half()
+            if average_loss < best_loss:
+                best_loss = average_loss
+                save_path = os.path.join(args.work_dir, "models", args.run_name, f"epoch{epoch + 1}_sam.pth")
+                state = {'model': model.float().state_dict(), 'optimizer': optimizer}
+                torch.save(state, save_path)
+                if args.use_amp:
+                    model = model.half()
 
-        end = time.time()
-        print("Run epoch time: %.2fs" % (end - start))
+            end = time.time()
+            print("Run epoch time: %.2fs" % (end - start))
 
 
 if __name__ == '__main__':

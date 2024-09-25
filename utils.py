@@ -30,7 +30,7 @@ def get_boxes_from_mask(mask, box_num=1, std = 0.1, max_pixel = 5):
 
     # Iterate through all regions and get the bounding box coordinates
     boxes = [tuple(region.bbox) for region in regions]
-
+    # print(len(boxes))
     # If the generated number of boxes is greater than the number of categories,
     # sort them by region area and select the top n regions
     if len(boxes) >= box_num:

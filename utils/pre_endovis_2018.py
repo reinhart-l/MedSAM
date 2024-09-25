@@ -5,6 +5,7 @@ join = os.path.join
 from skimage import io, transform, measure, morphology
 from tqdm import tqdm
 import cc3d
+import torch
 # import  ckpt_convert
 # convert 2D data to npy files, including images and corresponding masks
 modality = 'dd'  # e.g., 'Dermoscopy
@@ -14,10 +15,10 @@ gt_name_suffix = '.png'
 # prefix = modality + '_' + anatomy + '_'
 save_suffix = '.npy'
 image_size = 1024
-img_path = '../data/endovis_2018_instrument/val/images'  # path to the images
-gt_path = '../data/endovis_2018_instrument/val/annotations'  # path to the corresponding annotations
-npy_path = '../data/endovis_2018_instrument/val/npy'  # save npy path e.g., MedSAM/data/npy/; don't miss the `/`
-output_path = '../data/endovis_2018_instrument/val/binary_annotations'  # 输出路径
+img_path = '../data/endovis_2018_instrument/train/images'  # path to the images
+gt_path = '../data/endovis_2018_instrument/train/annotations'  # path to the corresponding annotations
+npy_path = '../data/endovis_2018_instrument/train/npy'  # save npy path e.g., MedSAM/data/npy/; don't miss the `/`
+output_path = '../data/endovis_2018_instrument/train/binary_annotations'  # 输出路径
 os.makedirs(join(npy_path, "gts"), exist_ok=True)
 os.makedirs(join(npy_path, "imgs"), exist_ok=True)
 os.makedirs(join(npy_path, "bi_gts"), exist_ok=True)
@@ -33,6 +34,8 @@ label_id_offset = 0
 do_intensity_cutoff = False  # True for grey images
 # %% save preprocessed images and masks as npz files
 for name in tqdm(names):
+    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+    print(f"Using {device}")
     image_name = name.split(gt_name_suffix)[0] + img_name_suffix
     gt_name = name
     npy_save_name = gt_name.split(gt_name_suffix)[0] + save_suffix
@@ -97,7 +100,7 @@ for name in tqdm(names):
 
     # 这里存储的npz形式是将图片和mask打包 但是是原尺寸
     # np.savez_compressed(join(npy_path, gt_name.split(gt_name_suffix)[0] + '.npz'), imgs=image_data_pre,
-    #                     gts=gt_data_ori)
+    #                      gts=gt_data_ori)
     resize_img = transform.resize(image_data_pre, (image_size, image_size), order=3, mode='constant',
                                   preserve_range=True, anti_aliasing=True)
     resize_img01 = resize_img / 255.0

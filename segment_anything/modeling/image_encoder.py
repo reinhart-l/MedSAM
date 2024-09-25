@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 
@@ -14,6 +13,46 @@ from typing import Optional, Tuple, Type
 from .common import LayerNorm2d, MLPBlock
 
 
+class Adapter_Layer(nn.Module):
+    def __init__(self, embed_dim, mlp_ratio=0.25, norm_layer=nn.LayerNorm, skip_connect=True):
+        super().__init__()
+        self.skip_connect = skip_connect
+        hidden_dim = int(embed_dim * mlp_ratio)
+        self.norm = norm_layer(embed_dim)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.channel = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim, bias=False),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, embed_dim, bias=False),
+            nn.Sigmoid()
+        )
+
+        self.spatial = nn.Sequential(
+            nn.Conv2d(embed_dim, embed_dim, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.ReLU(),
+            nn.ConvTranspose2d(embed_dim, embed_dim, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.ReLU(),
+        )
+
+        for m in self.modules():
+            if isinstance(m, (nn.Linear, nn.Conv2d, nn.ConvTranspose2d)):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+
+    def forward(self, x):
+        # x -> （B, H, W, C）-> （B, C, H, W）
+        x = x.permute(0, 3, 1, 2)
+        B, C, _, _ = x.size()
+        x_channel = self.channel(self.avg_pool(x).view(B, C)).view(B, C, 1, 1) * x
+        x_spatial = self.spatial(x_channel)
+
+        if self.skip_connect:
+            x = x + x_spatial
+        else:
+            x = x_spatial
+        # （B, C, H, W） -> (B, H, W, C)
+        x = x.permute(0, 2, 3, 1)
+        return self.norm(x)
+# 实现图像嵌入，主要包括patch_embed、block和neck三个部分
 # This class and its supporting functions below lightly adapted from the ViTDet backbone available at: https://github.com/facebookresearch/detectron2/blob/main/detectron2/modeling/backbone/vit.py # noqa
 class ImageEncoderViT(nn.Module):
     def __init__(
@@ -34,6 +73,7 @@ class ImageEncoderViT(nn.Module):
         rel_pos_zero_init: bool = True,
         window_size: int = 0,
         global_attn_indexes: Tuple[int, ...] = (),
+        adapter_train=False
     ) -> None:
         """
         Args:
@@ -55,39 +95,39 @@ class ImageEncoderViT(nn.Module):
         """
         super().__init__()
         self.img_size = img_size
-
+        # 将图像划分为Patch
         self.patch_embed = PatchEmbed(
-            kernel_size=(patch_size, patch_size),
-            stride=(patch_size, patch_size),
-            in_chans=in_chans,
-            embed_dim=embed_dim,
+            kernel_size=(patch_size, patch_size),# 卷积核大小(16, 16)
+            stride=(patch_size, patch_size),# 卷积核步长(16, 16)
+            in_chans=in_chans,# 输入图像通道=3
+            embed_dim=embed_dim,# patch嵌入维度=768
         )
-
+        # 位置编码
         self.pos_embed: Optional[nn.Parameter] = None
         if use_abs_pos:
             # Initialize absolute positional embedding with pretrain image size.
             self.pos_embed = nn.Parameter(
-                torch.zeros(
-                    1, img_size // patch_size, img_size // patch_size, embed_dim
-                )
-            )
-
+                torch.zeros(1, img_size // patch_size, img_size // patch_size, embed_dim)
+            )# 可学习参数[1, 64, 64, 768]
+        # Block模块
         self.blocks = nn.ModuleList()
         for i in range(depth):
             block = Block(
-                dim=embed_dim,
-                num_heads=num_heads,
-                mlp_ratio=mlp_ratio,
-                qkv_bias=qkv_bias,
-                norm_layer=norm_layer,
-                act_layer=act_layer,
-                use_rel_pos=use_rel_pos,
-                rel_pos_zero_init=rel_pos_zero_init,
+                dim=embed_dim,# 嵌入维度=768
+                num_heads=num_heads,# multi-head注意机制多头的数目=12
+                mlp_ratio=mlp_ratio,# MLP隐藏层的维度变换因子=4
+                qkv_bias=qkv_bias,# qkv全连接层的偏置=True
+                norm_layer=norm_layer,# 归一化层: nn.LayerNorm
+                act_layer=act_layer,# 激活函数层: nn.GELU
+                use_rel_pos=use_rel_pos,# 是否添加相对位置嵌入=False
+                rel_pos_zero_init=rel_pos_zero_init,# 零初始化相对位置参数=True
+                # 12个Block中的window_size[14,14,0,14,14,0,14,14,0,14,14,0]
                 window_size=window_size if i not in global_attn_indexes else 0,
-                input_size=(img_size // patch_size, img_size // patch_size),
+                input_size=(img_size // patch_size, img_size // patch_size),# 输入大小(64, 64)
+                adapter=adapter_train,
             )
             self.blocks.append(block)
-
+        # 输出neck模块
         self.neck = nn.Sequential(
             nn.Conv2d(
                 embed_dim,
@@ -107,14 +147,16 @@ class ImageEncoderViT(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.patch_embed(x)
+        # 输入x.size():[1, 3, 1024, 1024]
+        x = self.patch_embed(x) # [1, 64, 64, 768]
         if self.pos_embed is not None:
-            x = x + self.pos_embed
-
+             # 添加位置编码
+            x = x + self.pos_embed# [1, 64, 64, 768]
+        # attention模块
         for blk in self.blocks:
-            x = blk(x)
+            x = blk(x) # [1, 64, 64, 768]
 
-        x = self.neck(x.permute(0, 3, 1, 2))
+        x = self.neck(x.permute(0, 3, 1, 2))# 输出x.size():[1, 256, 64, 64]
 
         return x
 
@@ -134,6 +176,7 @@ class Block(nn.Module):
         rel_pos_zero_init: bool = True,
         window_size: int = 0,
         input_size: Optional[Tuple[int, int]] = None,
+        adapter: bool = False
     ) -> None:
         """
         Args:
@@ -147,11 +190,12 @@ class Block(nn.Module):
             rel_pos_zero_init (bool): If True, zero initialize relative positional parameters.
             window_size (int): Window size for window attention blocks. If it equals 0, then
                 use global attention.
-            input_size (tuple(int, int) or None): Input resolution for calculating the relative
-                positional parameter size.
+            input_size (int or None): Input resolution for calculating the relative positional
+                parameter size.
         """
         super().__init__()
-        self.norm1 = norm_layer(dim)
+        self.norm1 = norm_layer(dim)# 归一化层nn.LayerNorm
+        self.adapter = adapter
         self.attn = Attention(
             dim,
             num_heads=num_heads,
@@ -161,28 +205,36 @@ class Block(nn.Module):
             input_size=input_size if window_size == 0 else (window_size, window_size),
         )
 
-        self.norm2 = norm_layer(dim)
-        self.mlp = MLPBlock(
-            embedding_dim=dim, mlp_dim=int(dim * mlp_ratio), act=act_layer
-        )
+        self.norm2 = norm_layer(dim) # 归一化层nn.LayerNorm
+        # MLP模块, mlp_ratio=4, act_layer=nn.GELU
+        self.mlp = MLPBlock(embedding_dim=dim, mlp_dim=int(dim * mlp_ratio), act=act_layer)
 
-        self.window_size = window_size
+        self.window_size = window_size# 窗口大小=14或0
+        if self.adapter:
+            self.Adapter = Adapter_Layer(dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        shortcut = x
+        shortcut = x # [1, 64, 64, 768]
         x = self.norm1(x)
         # Window partition
         if self.window_size > 0:
-            H, W = x.shape[1], x.shape[2]
+            H, W = x.shape[1], x.shape[2] # H=64, W=64
+            # x.size():[25, 14, 14, 768], Pad_hw.size():[70, 70]
             x, pad_hw = window_partition(x, self.window_size)
 
-        x = self.attn(x)
+        x = self.attn(x) # [25, 14, 14, 768]
         # Reverse window partition
+        # 消除padding
         if self.window_size > 0:
-            x = window_unpartition(x, self.window_size, pad_hw, (H, W))
+            x = window_unpartition(x, self.window_size, pad_hw, (H, W)) # [1, 64, 64, 768]
 
-        x = shortcut + x
-        x = x + self.mlp(self.norm2(x))
+        x = shortcut + x # 残差连接
+        # x = x + self.mlp(self.norm2(x)) # [1, 64, 64, 768]
+        if self.adapter:
+            x_norm = self.norm2(x)
+            x = x + self.mlp(x_norm) + self.Adapter(x_norm)
+        else:
+            x = x + self.mlp(self.norm2(x))
 
         return x
 
@@ -203,18 +255,18 @@ class Attention(nn.Module):
         Args:
             dim (int): Number of input channels.
             num_heads (int): Number of attention heads.
-            qkv_bias (bool):  If True, add a learnable bias to query, key, value.
+            qkv_bias (bool:  If True, add a learnable bias to query, key, value.
             rel_pos (bool): If True, add relative positional embeddings to the attention map.
             rel_pos_zero_init (bool): If True, zero initialize relative positional parameters.
-            input_size (tuple(int, int) or None): Input resolution for calculating the relative
-                positional parameter size.
+            input_size (int or None): Input resolution for calculating the relative positional
+                parameter size.
         """
         super().__init__()
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim**-0.5
+        self.num_heads = num_heads  # head数目=12
+        head_dim = dim // num_heads  # 768/12=64
+        self.scale = head_dim**-0.5  # 0.125
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias) # (768, 768*3)
         self.proj = nn.Linear(dim, dim)
 
         self.use_rel_pos = use_rel_pos
@@ -229,34 +281,23 @@ class Attention(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, H, W, _ = x.shape
         # qkv with shape (3, B, nHead, H * W, C)
-        qkv = (
-            self.qkv(x).reshape(B, H * W, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
-        )
+        qkv = self.qkv(x).reshape(B, H * W, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
         # q, k, v with shape (B * nHead, H * W, C)
         q, k, v = qkv.reshape(3, B * self.num_heads, H * W, -1).unbind(0)
 
         attn = (q * self.scale) @ k.transpose(-2, -1)
 
         if self.use_rel_pos:
-            attn = add_decomposed_rel_pos(
-                attn, q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W)
-            )
+            attn = add_decomposed_rel_pos(attn, q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
 
         attn = attn.softmax(dim=-1)
-        x = (
-            (attn @ v)
-            .view(B, self.num_heads, H, W, -1)
-            .permute(0, 2, 3, 1, 4)
-            .reshape(B, H, W, -1)
-        )
+        x = (attn @ v).view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
         x = self.proj(x)
 
         return x
 
-
-def window_partition(
-    x: torch.Tensor, window_size: int
-) -> Tuple[torch.Tensor, Tuple[int, int]]:
+# 不重叠窗口划分
+def window_partition(x: torch.Tensor, window_size: int) -> Tuple[torch.Tensor, Tuple[int, int]]:
     """
     Partition into non-overlapping windows with padding if needed.
     Args:
@@ -267,31 +308,27 @@ def window_partition(
         windows: windows after partition with [B * num_windows, window_size, window_size, C].
         (Hp, Wp): padded height and width before partition
     """
-    B, H, W, C = x.shape
+    B, H, W, C = x.shape # [1, 64, 64, 768]
 
-    pad_h = (window_size - H % window_size) % window_size
-    pad_w = (window_size - W % window_size) % window_size
+    pad_h = (window_size - H % window_size) % window_size # 需要填充的高度=6
+    pad_w = (window_size - W % window_size) % window_size # 需要填充的宽度=6
     if pad_h > 0 or pad_w > 0:
-        x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h))
-    Hp, Wp = H + pad_h, W + pad_w
-
+        x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h)) # 填充为: [1, 70, 70, 768]
+    Hp, Wp = H + pad_h, W + pad_w # Hp=70, Wp=70
+    # 重塑为[1, 5, 14, 5, 14, 768]
     x = x.view(B, Hp // window_size, window_size, Wp // window_size, window_size, C)
-    windows = (
-        x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
-    )
+    # [25, 14, 14, 768]
+    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
     return windows, (Hp, Wp)
 
 
 def window_unpartition(
-    windows: torch.Tensor,
-    window_size: int,
-    pad_hw: Tuple[int, int],
-    hw: Tuple[int, int],
+    windows: torch.Tensor, window_size: int, pad_hw: Tuple[int, int], hw: Tuple[int, int]
 ) -> torch.Tensor:
     """
     Window unpartition into original sequences and removing padding.
     Args:
-        windows (tensor): input tokens with [B * num_windows, window_size, window_size, C].
+        x (tensor): input tokens with [B * num_windows, window_size, window_size, C].
         window_size (int): window size.
         pad_hw (Tuple): padded height and width (Hp, Wp).
         hw (Tuple): original height and width (H, W) before padding.
@@ -302,9 +339,7 @@ def window_unpartition(
     Hp, Wp = pad_hw
     H, W = hw
     B = windows.shape[0] // (Hp * Wp // window_size // window_size)
-    x = windows.view(
-        B, Hp // window_size, Wp // window_size, window_size, window_size, -1
-    )
+    x = windows.view(B, Hp // window_size, Wp // window_size, window_size, window_size, -1)
     x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, Hp, Wp, -1)
 
     if Hp > H or Wp > W:
@@ -378,9 +413,7 @@ def add_decomposed_rel_pos(
     rel_w = torch.einsum("bhwc,wkc->bhwk", r_q, Rw)
 
     attn = (
-        attn.view(B, q_h, q_w, k_h, k_w)
-        + rel_h[:, :, :, :, None]
-        + rel_w[:, :, :, None, :]
+        attn.view(B, q_h, q_w, k_h, k_w) + rel_h[:, :, :, :, None] + rel_w[:, :, :, None, :]
     ).view(B, q_h * q_w, k_h * k_w)
 
     return attn
@@ -405,7 +438,7 @@ class PatchEmbed(nn.Module):
             stride (Tuple): stride of the projection layer.
             padding (Tuple): padding size of the projection layer.
             in_chans (int): Number of input image channels.
-            embed_dim (int): Patch embedding dimension.
+            embed_dim (int):  embed_dim (int): Patch embedding dimension.
         """
         super().__init__()
 

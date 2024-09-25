@@ -126,7 +126,8 @@ class TrainingDataset(Dataset):
         self.mask_num = mask_num
         self.pixel_mean = [123.675, 116.28, 103.53]
         self.pixel_std = [58.395, 57.12, 57.375]
-
+        self.log_file = "boxes_log.json"
+        self.boxes_log = []
         dataset = json.load(open(os.path.join(data_dir, f'image2label_{mode}.json'), "r"))
         self.image_paths = list(dataset.keys())
         self.label_paths = list(dataset.values())
@@ -154,6 +155,7 @@ class TrainingDataset(Dataset):
         boxes_list = []
         point_coords_list, point_labels_list = [], []
         mask_path = random.choices(self.label_paths[index], k=self.mask_num)
+        # mask_path=self.label_paths[index]
         for m in mask_path:
             pre_mask = cv2.imread(m, 0)
             if pre_mask.max() == 255:
@@ -163,6 +165,10 @@ class TrainingDataset(Dataset):
             image_tensor, mask_tensor = augments['image'], augments['mask'].to(torch.int64)
 
             boxes = get_boxes_from_mask(mask_tensor)
+            # if boxes is None:
+            #     self.boxes_log.append(m)  # Log the mask path if boxes == 0
+            #     self.save_boxes_log()
+            #     continue  # Skip this iteration if boxes == 0
             point_coords, point_label = init_point_sampling(mask_tensor, self.point_num)
 
             masks_list.append(mask_tensor)
@@ -191,6 +197,11 @@ class TrainingDataset(Dataset):
     def __len__(self):
         return len(self.image_paths)
 
+    def save_boxes_log(self):
+        """Save the logged mask paths where boxes are 0."""
+        with open(self.log_file, 'w') as f:
+            json.dump(self.boxes_log, f)
+
 
 def stack_dict_batched(batched_input):
     out_dict = {}
@@ -203,18 +214,18 @@ def stack_dict_batched(batched_input):
 
 
 if __name__ == "__main__":
-    # train_dataset = TrainingDataset("data/endovis_2018_instrument/val", image_size=1024, mode='train', requires_name=True, point_num=1,
-    #                                 mask_num=5)
-    # print("Dataset:", len(train_dataset))
-    # train_batch_sampler = DataLoader(dataset=train_dataset, batch_size=2, shuffle=True, num_workers=4)
-    # for i, batched_image in enumerate(tqdm(train_batch_sampler)):
-    #     batched_image = stack_dict_batched(batched_image)
-    #     print(batched_image["image"].shape, batched_image["label"].shape)
-    test_dataset = TestingDataset("data/endovis_2018_instrument/val", image_size=1024, mode='test',
-                                    requires_name=True, point_num=1)
-    print("Dataset:", len(test_dataset))
-    train_batch_sampler = DataLoader(dataset=test_dataset, batch_size=1, shuffle=True, num_workers=4)
+    train_dataset = TrainingDataset("data/SIS/example/", image_size=1024, mode='train', requires_name=True, point_num=1,
+                                    mask_num=5)
+    print("Dataset:", len(train_dataset))
+    train_batch_sampler = DataLoader(dataset=train_dataset, batch_size=2, shuffle=True, num_workers=4)
     for i, batched_image in enumerate(tqdm(train_batch_sampler)):
         batched_image = stack_dict_batched(batched_image)
         print(batched_image["image"].shape, batched_image["label"].shape)
+    # test_dataset = TestingDataset("data/endovis_2018_instrument/val", image_size=1024, mode='test',
+    #                                 requires_name=True, point_num=1)
+    # print("Dataset:", len(test_dataset))
+    # train_batch_sampler = DataLoader(dataset=test_dataset, batch_size=1, shuffle=True, num_workers=4)
+    # for i, batched_image in enumerate(tqdm(train_batch_sampler)):
+    #     batched_image = stack_dict_batched(batched_image)
+    #     print(batched_image["image"].shape, batched_image["label"].shape)
 

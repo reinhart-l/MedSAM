@@ -27,7 +27,7 @@ def parse_args():
     # parser.add_argument("--run_name", type=str, default="MedSAM", help="run model name")
 
     parser.add_argument("--epochs", type=int, default=20, help="number of epochs")
-    parser.add_argument("--batch_size", type=int, default=2, help="train batch size")
+    parser.add_argument("--batch_size", type=int, default=4, help="train batch size")
     parser.add_argument("--image_size", type=int, default=1024, help="image_size")
     parser.add_argument("--mask_num", type=int, default=5, help="get mask number")
     parser.add_argument("--data_path", type=str, default="./data/SIS/train", help="train data path")
@@ -43,6 +43,9 @@ def parse_args():
     parser.add_argument("--multimask", type=bool, default=False, help="ouput multimask")
     parser.add_argument("--encoder_adapter", type=bool, default=True, help="use adapter")
     parser.add_argument("--use_amp", type=bool, default=False, help="use amp")
+
+    # 新增 gpus 参数，指定多个 GPU
+    parser.add_argument("--gpus", type=str, default="1,3", help="GPU ids to use, separated by commas")
     args = parser.parse_args()
     if args.resume is not None:
         args.checkpoint = None
@@ -65,34 +68,41 @@ def to_device(batch_input, device):
 
 
 def prompt_and_decoder(args, batched_input, model, image_embeddings, decoder_iter=False):
+    # 检查模型是否被 DataParallel 包装
+    prompt_encoder = model.module.prompt_encoder if isinstance(model, torch.nn.DataParallel) else model.prompt_encoder
+    mask_decoder = model.module.mask_decoder if isinstance(model, torch.nn.DataParallel) else model.mask_decoder
+
+    # 处理 points 参数
     if batched_input["point_coords"] is not None:
         points = (batched_input["point_coords"], batched_input["point_labels"])
     else:
         points = None
+
     # decoder_iter如果为true就冻结prompt_encoder
     if decoder_iter:
         with torch.no_grad():
-            sparse_embeddings, dense_embeddings = model.prompt_encoder(
+            sparse_embeddings, dense_embeddings = prompt_encoder(
                 points=points,
                 boxes=batched_input.get("boxes", None),
                 masks=batched_input.get("mask_inputs", None),
             )
-
     else:
-        sparse_embeddings, dense_embeddings = model.prompt_encoder(
+        sparse_embeddings, dense_embeddings = prompt_encoder(
             points=points,
             boxes=batched_input.get("boxes", None),
             masks=batched_input.get("mask_inputs", None),
         )
 
-    low_res_masks, iou_predictions = model.mask_decoder(
+    # 调用 mask_decoder
+    low_res_masks, iou_predictions = mask_decoder(
         image_embeddings=image_embeddings,
-        image_pe=model.prompt_encoder.get_dense_pe(),
+        image_pe=prompt_encoder.get_dense_pe(),
         sparse_prompt_embeddings=sparse_embeddings,
         dense_prompt_embeddings=dense_embeddings,
         multimask_output=args.multimask,
     )
 
+    # 如果multimask为True，选择iou预测最大值对应的mask
     if args.multimask:
         max_values, max_indexs = torch.max(iou_predictions, dim=1)
         max_values = max_values.unsqueeze(1)
@@ -101,8 +111,10 @@ def prompt_and_decoder(args, batched_input, model, image_embeddings, decoder_ite
         for i, idx in enumerate(max_indexs):
             low_res.append(low_res_masks[i:i + 1, idx])
         low_res_masks = torch.stack(low_res, 0)
-    # 双线性插值
-    masks = F.interpolate(low_res_masks, (args.image_size, args.image_size), mode="bilinear", align_corners=False, )
+
+    # 双线性插值调整mask大小
+    masks = F.interpolate(low_res_masks, (args.image_size, args.image_size), mode="bilinear", align_corners=False)
+
     return masks, low_res_masks, iou_predictions
 
 
@@ -121,7 +133,10 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion):
             batched_input["boxes"] = None
             flag = "point"
 
-        for n, value in model.image_encoder.named_parameters():
+        # Access the model components based on whether it is wrapped in DataParallel
+        image_encoder = model.module.image_encoder if isinstance(model, nn.DataParallel) else model.image_encoder
+
+        for n, value in image_encoder.named_parameters():
             if "Adapter" in n:
                 value.requires_grad = True
             else:
@@ -129,7 +144,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion):
 
         if args.use_amp:
             labels = batched_input["label"].half()
-            image_embeddings = model.image_encoder(batched_input["image"].half())
+            image_embeddings = image_encoder(batched_input["image"].half())
 
             batch, _, _, _ = image_embeddings.shape
             image_embeddings_repeat = []
@@ -147,7 +162,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion):
 
         else:
             labels = batched_input["label"]
-            image_embeddings = model.image_encoder(batched_input["image"])
+            image_embeddings = image_encoder(batched_input["image"])
 
             batch, _, _, _ = image_embeddings.shape
             image_embeddings_repeat = []
@@ -174,6 +189,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion):
         batched_input = to_device(batched_input, args.device)
 
         image_embeddings = image_embeddings.detach().clone()
+
         for n, value in model.named_parameters():
             if "image_encoder" in n:
                 value.requires_grad = False
@@ -233,9 +249,19 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion):
     return train_losses, train_iter_metrics
 
 
+
 def main(args):
+    # 设置 GPU 设备
+    device_ids = [int(id) for id in args.gpus.split(',')]  # 将 GPU id 列表转换为整数列表
+    args.device = torch.device(f"cuda:{device_ids[0]}")  # 主设备
+
+    # 创建模型，并使用 DataParallel 进行多 GPU 训练
     model = sam_model_registry[args.model_type](args).to(args.device)
-    # model = sam_model_registry[args.model_type](checkpoint=args.checkpoint).to(args.device)
+
+    # 将模型并行化到多个 GPU 上
+    if len(device_ids) > 1:
+        model = torch.nn.DataParallel(model, device_ids=device_ids)
+
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     criterion = FocalDiceloss_IoULoss()
 
@@ -258,8 +284,7 @@ def main(args):
 
     train_dataset = TrainingDataset(args.data_path, image_size=args.image_size, mode='train', point_num=1,
                                     mask_num=args.mask_num, requires_name=False)
-    train_dataset.save_boxes_log()
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=8)
     print('*******Train data:', len(train_dataset))
 
     loggers = get_logger(
@@ -296,6 +321,7 @@ def main(args):
 
         end = time.time()
         print("Run epoch time: %.2fs" % (end - start))
+
 
 
 if __name__ == '__main__':
