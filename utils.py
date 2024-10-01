@@ -410,3 +410,22 @@ class FocalDiceloss_IoULoss(nn.Module):
         loss2 = self.maskiou_loss(pred, mask, pred_iou)
         loss = loss1 + loss2 * self.iou_scale
         return loss
+
+
+class FocalDiceloss(nn.Module):
+
+    def __init__(self):
+        super(FocalDiceloss, self).__init__()
+        self.focal_loss = FocalLoss()
+        self.dice_loss = DiceLoss()
+
+    def forward(self, pred, mask):
+        """
+        pred: [B, 1, H, W]
+        mask: [B, 1, H, W]
+        """
+        assert pred.shape == mask.shape, "pred and mask should have the same shape."
+
+        focal_loss = self.focal_loss(pred, mask)
+        dice_loss = self.dice_loss(pred, mask)
+        return focal_loss, dice_loss

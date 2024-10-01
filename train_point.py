@@ -16,12 +16,16 @@ from torch.nn import functional as F
 # from apex import amp
 import random
 
-
+from sam_unet.models.sam_unet_model import SAM_UNET
+from sam_unet.utils.loss import FocalDiceloss
+# from sam_unet.utils.utils import get_logger, setup_seeds
+# from sam_unet.utils.metrics import SegMetrics
+from sam_unet.config import config_dict
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--work_dir", type=str, default="work_dir", help="work dir")
 
-    parser.add_argument("--run_name", type=str, default="MedSAM_adapter_25epo", help="run model name")
+    parser.add_argument("--run_name", type=str, default="MedSAM_adapter_25epo_test", help="run model name")
     # parser.add_argument("--run_name", type=str, default="MedSAM_adapter", help="run model name")
     # parser.add_argument("--run_name", type=str, default="MedSAM_adapter", help="run model name")
     # parser.add_argument("--run_name", type=str, default="MedSAM", help="run model name")
@@ -32,7 +36,7 @@ def parse_args():
     parser.add_argument("--mask_num", type=int, default=5, help="get mask number")
     parser.add_argument("--data_path", type=str, default="./data/SIS/train", help="train data path")
     parser.add_argument("--metrics", nargs='+', default=['iou', 'dice'], help="metrics")
-    parser.add_argument('--device', type=str, default='cuda:1')
+    parser.add_argument('--device', type=str, default='cuda:3')
     parser.add_argument("--lr", type=float, default=1e-4, help="learning rate")
     parser.add_argument("--resume", type=str, default=None, help="load resume")
     parser.add_argument("--model_type", type=str, default="vit_b", help="sam model_type")
@@ -234,7 +238,8 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion):
 
 
 def main(args):
-    model = sam_model_registry[args.model_type](args).to(args.device)
+    # model = sam_model_registry[args.model_type](args).to(args.device)
+    model = SAM_UNET().to(args.device)
     # model = sam_model_registry[args.model_type](checkpoint=args.checkpoint).to(args.device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     criterion = FocalDiceloss_IoULoss()

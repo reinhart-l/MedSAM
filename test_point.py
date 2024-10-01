@@ -27,26 +27,26 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--work_dir", type=str, default="work_dir", help="work dir")
 
-    # parser.add_argument("--run_name", type=str, default="SAM", help="run model name")
-    # parser.add_argument("--run_name", type=str, default="MedSAM", help="run model name")
+    # parser.add_argument("--run_name", type=str, default="SAM_SIS", help="run model name")
+    parser.add_argument("--run_name", type=str, default="MedSAM_SIS", help="run model name")
     # parser.add_argument("--run_name", type=str, default="SAM_train_endovis_2018", help="run model name")
     # parser.add_argument("--run_name", type=str, default="SAM_train_endovis_2018_adapter", help="run model name")
     # parser.add_argument("--run_name", type=str, default="SAM_train_endovis_2018_adapter_20epo", help="run model name")
-    parser.add_argument("--run_name", type=str, default="SAM_train_endovis_2018_adapter_25epo", help="run model name")
+    # parser.add_argument("--run_name", type=str, default="SAM_train_endovis_2018_adapter_25epo", help="run model name")
 
     parser.add_argument("--batch_size", type=int, default=1, help="batch size")
     parser.add_argument("--image_size", type=int, default=1024, help="image_size")
     parser.add_argument('--device', type=str, default='cuda:2')
-    parser.add_argument("--data_path", type=str, default="data/endovis_2018_instrument/val", help="train data path")
+    parser.add_argument("--data_path", type=str, default="./data/SIS/test", help="train data path")
     parser.add_argument("--metrics", nargs='+', default=['iou', 'dice'], help="metrics")
     parser.add_argument("--model_type", type=str, default="vit_b", help="sam model_type")
 
     # parser.add_argument("--checkpoint", type=str, default="./work_dir/models/MedSAM/epoch15_sam.pth", help="sam checkpoint")
     # parser.add_argument("--checkpoint", type=str, default="./work_dir/SAM/sam_vit_b_01ec64.pth",help="sam checkpoint")
-    # parser.add_argument("--checkpoint", type=str, default="./work_dir/MedSAM/medsam_vit_b.pth", help="sam checkpoint")
+    parser.add_argument("--checkpoint", type=str, default="./work_dir/MedSAM/medsam_vit_b.pth", help="sam checkpoint")
     # parser.add_argument("--checkpoint", type=str, default="./work_dir/models/MedSAM_adapter/epoch13_sam.pth", help="sam checkpoint")
     # parser.add_argument("--checkpoint", type=str, default="./work_dir/models/MedSAM_adapter_20epo/epoch16_sam.pth",help="sam checkpoint")
-    parser.add_argument("--checkpoint", type=str, default="./work_dir/models/MedSAM_adapter_25epo/epoch20_sam.pth",help="sam checkpoint")
+    # parser.add_argument("--checkpoint", type=str, default="./work_dir/models/MedSAM_adapter_25epo/epoch20_sam.pth",help="sam checkpoint")
 
     parser.add_argument("--boxes_prompt", type=bool, default=False, help="use boxes prompt")
     parser.add_argument("--point_num", type=int, default=1, help="point num")
@@ -189,9 +189,10 @@ def main(args):
 
         else:
             save_path = os.path.join(f"{args.work_dir}", args.run_name,
-                                     f"iter{args.iter_point if args.iter_point > 1 else args.point_num}_prompt")
+                                     f"iter{args.iter_point}_prompt" if args.iter_point > 1 else f'init{args.point_num}_prompt')
             save_path_imgs = os.path.join(f"{args.work_dir}", args.run_name,
-                                     f"iter{args.iter_point if args.iter_point > 1 else args.point_num}_prompt_with_imgs")
+                                          f"iter{args.iter_point}_prompt_with_imgs" if args.iter_point > 1 else f'init{args.point_num}_prompt_with_imgs')
+
             batched_input["boxes"] = None
             point_coords, point_labels = [batched_input["point_coords"]], [batched_input["point_labels"]]
 
@@ -245,7 +246,8 @@ def main(args):
     if args.boxes_prompt:
         log_Test_type = "boxes_prompt"
     else:
-        log_Test_type =  f"iter{args.iter_point if args.iter_point > 1 else args.point_num}_prompt_with_imgs"
+        log_Test_type = f"iter{args.iter_point}_prompt_with_imgs" if args.iter_point > 1 else f'init{args.point_num}_prompt_with_imgs'
+
     log_Test_loss = f"Test loss: {average_loss:.4f}, metrics: {test_metrics}"
     log_MedSAM_Test_loss =  f"MedSAM Test loss: {average_MedSAM_loss:.4f}, metrics: {test_metrics}"
     with open(os.path.join(args.work_dir, args.run_name, f'{log_Test_type}_log.json'), 'w') as f:
